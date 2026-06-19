@@ -180,6 +180,26 @@ private enum Gemma4PositionOffset {
     case batch(MLXArray)
 }
 
+private enum Gemma4SharedKVState {
+    case regular(keys: MLXArray, values: MLXArray)
+    case quantized(
+        keys: (MLXArray, MLXArray, MLXArray?),
+        values: (MLXArray, MLXArray, MLXArray?),
+        groupSize: Int,
+        bits: Int,
+        mode: QuantizationMode
+    )
+
+    var sequenceLength: Int {
+        switch self {
+        case .regular(let keys, _):
+            keys.dim(2)
+        case .quantized(let keys, _, _, _, _):
+            keys.0.dim(-2)
+        }
+    }
+}
+
 private func gemma4CapturePositionOffset(from cache: KVCache?) -> Gemma4PositionOffset {
     if let batchCache = cache as? BatchPositionedKVCache {
         // Snapshot the per-sequence offsets before cache.update(...) advances them.
@@ -199,6 +219,26 @@ private func gemma4ApplyRotaryPosition<R: RoPELayer>(
         rope(x, offset: value)
     case .batch(let values):
         rope(x, offset: values)
+    }
+}
+
+private func gemma4AdjustAttentionMask(
+    _ mask: MLXFast.ScaledDotProductAttentionMaskMode?,
+    keyLength: Int
+) -> MLXFast.ScaledDotProductAttentionMaskMode {
+    guard let mask else {
+        return .none
+    }
+    switch mask {
+    case .array(let maskArray):
+        let maskLength = maskArray.dim(-1)
+        guard maskLength > keyLength else {
+            return mask
+        }
+        let start = maskLength - keyLength
+        return .array(maskArray[.ellipsis, start...])
+    case .arrays, .causal, .none:
+        return mask
     }
 }
 
@@ -260,20 +300,17 @@ private class Gemma4Attention: Module {
         self._kNorm.wrappedValue = RMSNorm(dimensions: effectiveHeadDim, eps: config.rmsNormEps)
         self._vNorm.wrappedValue = RMSNormNoScale(eps: config.rmsNormEps)
 
-        // RoPE: sliding uses default, full uses proportional with partial rotation
-        if isSliding {
-            self.rope = initializeRope(
-                dims: effectiveHeadDim, base: config.slidingRopeTheta, traditional: false,
-                scalingConfig: nil, maxPositionEmbeddings: nil)
-        } else {
-            self.rope = initializeRope(
-                dims: effectiveHeadDim, base: config.fullRopeTheta, traditional: false,
-                scalingConfig: [
-                    "type": .string("proportional"),
-                    "partial_rotary_factor": .float(config.fullPartialRotaryFactor),
-                ],
-                maxPositionEmbeddings: nil)
-        }
+        let ropeKey = isSliding ? "sliding_attention" : "full_attention"
+        let ropeConfig = config.ropeParameters?[ropeKey]
+        let ropeTheta =
+            ropeConfig?["rope_theta"]?.asFloat()
+            ?? (isSliding ? config.slidingRopeTheta : config.fullRopeTheta)
+        self.rope = initializeRope(
+            dims: effectiveHeadDim,
+            base: ropeTheta,
+            traditional: false,
+            scalingConfig: ropeConfig,
+            maxPositionEmbeddings: config.maxPositionEmbeddings)
 
         super.init()
     }
@@ -282,25 +319,25 @@ private class Gemma4Attention: Module {
         _ x: MLXArray,
         mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil,
         cache: KVCache? = nil,
-        sharedKV: (MLXArray, MLXArray)? = nil,
+        sharedKV: Gemma4SharedKVState? = nil,
         positionOffset: Gemma4PositionOffset? = nil
-    ) -> (MLXArray, (MLXArray, MLXArray), Gemma4PositionOffset) {
+    ) -> (MLXArray, Gemma4SharedKVState, Gemma4PositionOffset) {
         let (B, L, _) = (x.dim(0), x.dim(1), x.dim(2))
 
         var queries = qProj(x).reshaped(B, L, nHeads, effectiveHeadDim)
         queries = qNorm(queries)
 
-        let keys: MLXArray
-        let values: MLXArray
-        let activePositionOffset = positionOffset ?? gemma4CapturePositionOffset(from: cache)
+        let kvState: Gemma4SharedKVState
+        let activePositionOffset: Gemma4PositionOffset
 
-        if let (sharedK, sharedV) = sharedKV {
+        if let sharedKV {
             // KV-shared layers use pre-computed KV from an earlier layer
-            keys = sharedK
-            values = sharedV
+            activePositionOffset = positionOffset ?? .scalar(0)
+            kvState = sharedKV
         } else {
-            var k = kProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
-            k = kNorm(k)
+            activePositionOffset = positionOffset ?? gemma4CapturePositionOffset(from: cache)
+            let rawK = kProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+            var k = kNorm(rawK)
             k = k.transposed(0, 2, 1, 3)
             k = gemma4ApplyRotaryPosition(rope, to: k, offset: activePositionOffset)
 
@@ -308,44 +345,60 @@ private class Gemma4Attention: Module {
             if let vProj {
                 v = vProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
             } else {
-                v = k
+                v = rawK
             }
             v = vNorm(v)
             v = v.transposed(0, 2, 1, 3)
 
-            if let cache {
+            if let quantizedCache = cache as? QuantizedKVCacheProtocol {
+                let (quantizedKeys, quantizedValues) = quantizedCache.updateQuantized(
+                    keys: k, values: v)
+                kvState = .quantized(
+                    keys: quantizedKeys,
+                    values: quantizedValues,
+                    groupSize: quantizedCache.groupSize,
+                    bits: quantizedCache.bits,
+                    mode: quantizedCache.mode
+                )
+            } else if let cache {
                 let (updatedK, updatedV) = cache.update(keys: k, values: v)
-                keys = updatedK
-                values = updatedV
+                kvState = .regular(keys: updatedK, values: updatedV)
             } else {
-                keys = k
-                values = v
+                kvState = .regular(keys: k, values: v)
             }
         }
 
         queries = queries.transposed(0, 2, 1, 3)
         queries = gemma4ApplyRotaryPosition(rope, to: queries, offset: activePositionOffset)
 
-        // Adjust mask if cache size differs from mask size
-        var adjustedMask = mask
-        if case .array(let maskArray) = mask {
-            let keysSeqLen = keys.dim(2)
-            if maskArray.dim(-1) != keysSeqLen {
-                adjustedMask = .array(maskArray[.ellipsis, 0 ..< keysSeqLen])
+        let adjustedMask = gemma4AdjustAttentionMask(mask, keyLength: kvState.sequenceLength)
+        let attentionOutput =
+            switch kvState {
+            case .regular(let keys, let values):
+                MLXFast.scaledDotProductAttention(
+                    queries: queries,
+                    keys: keys,
+                    values: values,
+                    scale: scale,
+                    mask: adjustedMask
+                )
+            case .quantized(let keys, let values, let groupSize, let bits, let mode):
+                quantizedScaledDotProductAttention(
+                    queries: queries,
+                    quantizedKeys: keys,
+                    quantizedValues: values,
+                    scale: scale,
+                    mask: adjustedMask,
+                    groupSize: groupSize,
+                    bits: bits,
+                    mode: mode
+                )
             }
-        }
+        let output = attentionOutput
+            .transposed(0, 2, 1, 3)
+            .reshaped(B, L, -1)
 
-        let output = MLXFast.scaledDotProductAttention(
-            queries: queries,
-            keys: keys,
-            values: values,
-            scale: scale,
-            mask: adjustedMask ?? .none
-        )
-        .transposed(0, 2, 1, 3)
-        .reshaped(B, L, -1)
-
-        return (oProj(output), (keys, values), activePositionOffset)
+        return (oProj(output), kvState, activePositionOffset)
     }
 }
 
@@ -434,9 +487,9 @@ private class Gemma4DecoderLayer: Module {
         mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil,
         cache: KVCache? = nil,
         perLayerInput: MLXArray? = nil,
-        sharedKV: (MLXArray, MLXArray)? = nil,
+        sharedKV: Gemma4SharedKVState? = nil,
         positionOffset: Gemma4PositionOffset? = nil
-    ) -> (MLXArray, (MLXArray, MLXArray), Gemma4PositionOffset) {
+    ) -> (MLXArray, Gemma4SharedKVState, Gemma4PositionOffset) {
         let residual = x
 
         let h = inputLayernorm(x)
@@ -605,7 +658,7 @@ private class Gemma4TextModelInner: Module {
         }
 
         // Forward through layers, tracking intermediate KV pairs for sharing
-        var intermediates = [(kv: (MLXArray, MLXArray)?, positionOffset: Gemma4PositionOffset?)](
+        var intermediates = [(kv: Gemma4SharedKVState?, positionOffset: Gemma4PositionOffset?)](
             repeating: (nil, nil), count: config.numHiddenLayers)
 
         for (idx, layer) in layers.enumerated() {
@@ -644,7 +697,13 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     public init(_ config: Gemma4TextConfiguration) {
         self.config = config
         self.vocabularySize = config.vocabSize
-        self.kvHeads = (0 ..< config.numHiddenLayers).map { _ in config.numKeyValueHeads }
+        self.kvHeads = (0 ..< config.numHiddenLayers).map { idx in
+            let layerType = config.layerTypes[idx]
+            if config.attentionKeqV && layerType == "full_attention" {
+                return config.numGlobalKeyValueHeads ?? config.numKeyValueHeads
+            }
+            return config.numKeyValueHeads
+        }
         self.model = Gemma4TextModelInner(config)
 
         if !config.tieWordEmbeddings {
@@ -683,15 +742,13 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     public func newCache(parameters: GenerateParameters?) -> [any KVCache] {
         let firstKvShared = config.numHiddenLayers - config.numKvSharedLayers
 
-        var caches = [any KVCache]()
-        for i in 0 ..< firstKvShared {
-            if config.layerTypes[i] == "full_attention" {
-                caches.append(StandardKVCache())
-            } else {
-                caches.append(RotatingKVCache(maxSize: config.slidingWindow, keep: 0))
+        let slidingWindow = config.slidingWindow > 0 ? config.slidingWindow : 4096
+        return config.layerTypes.prefix(firstKvShared).map { layerType in
+            if layerType == "full_attention" {
+                return StandardKVCache()
             }
+            return RotatingKVCache(maxSize: slidingWindow, keep: 0)
         }
-        return caches
     }
 }
 

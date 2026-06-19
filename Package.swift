@@ -36,7 +36,7 @@ let package = Package(
             targets: ["IntegrationTestHelpers"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.31.3")),
+        .package(url: "https://github.com/Sequins-dev/mlx-swift", branch: "smolx-gguf-q4k"),
         .package(url: "https://github.com/swiftlang/swift-syntax.git", from: "600.0.0-latest"),
     ],
     targets: [
@@ -69,6 +69,7 @@ let package = Package(
         .target(
             name: "MLXLMCommon",
             dependencies: [
+                "GGUFIQDequantizer",
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXOptimizers", package: "mlx-swift"),
@@ -77,6 +78,11 @@ let package = Package(
             exclude: [
                 "README.md"
             ]
+        ),
+        .target(
+            name: "GGUFIQDequantizer",
+            path: "Libraries/GGUFIQDequantizer",
+            publicHeadersPath: "include"
         ),
         .target(
             name: "MLXEmbedders",
