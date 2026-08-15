@@ -26,9 +26,11 @@ extension LLMModel {
 
         // Prepare the prompt in chunks if larger than the prefill size
         while y.tokens.size > prefillStepSize {
+            try Task.checkCancellation()
             let input = y[.newAxis, ..<prefillStepSize]
             _ = self(input, cache: cache.isEmpty ? nil : cache, state: nil)
             eval(cache)
+            try Task.checkCancellation()
             y = y[prefillStepSize...]
         }
 
